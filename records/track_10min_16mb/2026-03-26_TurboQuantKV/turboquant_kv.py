@@ -227,8 +227,8 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
         for chunk_start in range(0, total_tokens, chunk_size):
             chunk_end = min(chunk_start + chunk_size, total_tokens)
             T_new = chunk_end - chunk_start
-            x = val_tokens[chunk_start    : chunk_end    ].to(device).unsqueeze(0)
-            y = val_tokens[chunk_start + 1: chunk_end + 1].to(device)
+            x = val_tokens[chunk_start    : chunk_end    ].to(device).long().unsqueeze(0)
+            y = val_tokens[chunk_start + 1: chunk_end + 1].to(device).long()
 
             cache.begin_chunk(T_new)
             with turboquant_attention(model, cache):
