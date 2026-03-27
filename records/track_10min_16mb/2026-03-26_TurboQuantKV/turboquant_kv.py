@@ -6,6 +6,7 @@ from typing import Generator
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 # Lloyd-Max centroids for N(0,1) scalar quantization, symmetric about 0
 _CODEBOOKS: dict[int, list[float]] = {
@@ -192,7 +193,7 @@ def turboquant_attention(model, cache: TurboQuantKVCache) -> Generator[None, Non
                 )
 
             # Flash attention doesn't support arbitrary attn_mask; force math/efficient backend
-            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=True):
+            with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
                 y = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask)
 
             if attn.use_xsa:
