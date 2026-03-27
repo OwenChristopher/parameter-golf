@@ -1,8 +1,8 @@
 {
-  "name": "TurboQuant KV Cache — Full-Document Long-Context Eval",
+  "name": "Long-Context Training (4096) + Extended KV Cache Eval (8192)",
   "val_bpb": null,
   "bytes_total": null,
-  "blurb": "Same architecture as current record (11L U-Net, LeakyReLU²+TTT+Muon). Novel eval change: replace sliding-window re-computation with TurboQuant-compressed KV cache. Each token now attends to its FULL preceding document instead of a 2048-token window. TurboQuant_mse (Zandieh et al. 2025, arXiv:2504.19874): normalize → random rotate → Lloyd-Max scalar quantize at 3 bits. Quality-neutral vs fp16 per paper §4.2. No training changes; eval-only improvement.",
+  "blurb": "Same architecture as current record (11L U-Net, LeakyReLU²+TTT+Muon). Two changes: (1) Train with 4096-token sequences instead of 2048, so the model directly learns positions 0-4095 without NTK scaling. RoPE train_seq_len fixed to match TRAIN_SEQ_LEN. (2) Eval with bf16 extended KV cache (8192-token context) instead of sliding window. Pre-allocated GPU buffer [num_layers, 8192, H, D]; append() is in-place slice write; NTK-aware RoPE scaling for positions 4096-8191. Model trained on long context can exploit the cache at eval.",
   "author": "owen",
   "github_id": "OwenChristopher",
   "date": "2026-03-26"
