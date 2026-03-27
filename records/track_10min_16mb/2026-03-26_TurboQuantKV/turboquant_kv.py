@@ -1,5 +1,6 @@
 from __future__ import annotations
 import math
+import time
 from contextlib import contextmanager
 from typing import Generator
 
@@ -44,8 +45,9 @@ class TurboQuantKVCache:
     # At 3.5 bits quality-neutral vs fp16; at 2.5 bits marginal loss (per paper §4.2)
     #
     # GPU-resident dequantized buffer: pre-allocate [num_layers, max_tokens, H, D] on GPU.
-    # append() writes new tokens in-place at pos _total_tokens — no allocation per chunk.
-    # get() is a free slice — no concatenation, no CPU→GPU transfer, no decompression.
+    # append() writes new tokens in-place — no allocation per chunk.
+    # get() is a free slice — no concatenation, no decompression.
+    # _cos_sin_key/val: shared cos/sin table across all layers within one chunk (1× instead of 11×).
 
     def __init__(self, num_layers, num_kv_heads, head_dim, bits=3, device=None, seed=42,
                  max_tokens=8192):
@@ -61,7 +63,7 @@ class TurboQuantKVCache:
         cb = torch.tensor(_CODEBOOKS[bits], dtype=torch.float32, device=self.device)
         self.codebook: Tensor = cb / math.sqrt(head_dim)
 
-        # One orthogonal rotation per layer, stored on CPU (only seed is needed, not the matrix)
+        # One orthogonal rotation per layer, stored on CPU
         rng = torch.Generator()
         rng.manual_seed(seed)
         self._rot_cpu: list[Tensor] = []
@@ -76,10 +78,14 @@ class TurboQuantKVCache:
         self._v_nrm: list[list[Tensor]] = [[] for _ in range(num_layers)]
 
         # Pre-allocated GPU dequantized buffers — written in-place, never reallocated
-        # Shape: [num_layers, max_tokens, num_kv_heads, head_dim]
         buf_shape = (num_layers, max_tokens, num_kv_heads, head_dim)
         self._k_buf: Tensor = torch.empty(buf_shape, dtype=torch.bfloat16, device=self.device)
         self._v_buf: Tensor = torch.empty(buf_shape, dtype=torch.bfloat16, device=self.device)
+
+        # Cos/sin memo: all layers in a chunk share the same T_total and dtype,
+        # so compute once and reuse. Key = (T_total, dtype).
+        self._cos_sin_key: tuple | None = None
+        self._cos_sin_val: tuple[Tensor, Tensor] | None = None
 
         self._total_tokens: int = 0
         self._chunk_T:      int = 0
@@ -109,13 +115,12 @@ class TurboQuantKVCache:
         self._v_idx[layer].append(v_idx.reshape(T, H, D).cpu())
         self._k_nrm[layer].append(k_nrm.reshape(T, H).half().cpu())
         self._v_nrm[layer].append(v_nrm.reshape(T, H).half().cpu())
-        # In-place write into pre-allocated GPU buffer — no allocation, no copy overhead
+        # In-place write into pre-allocated GPU buffer
         pos = self._total_tokens
         self._k_buf[layer, pos:pos + T] = self._dequant(k_idx, k_nrm, rot).reshape(T, H, D).to(torch.bfloat16)
         self._v_buf[layer, pos:pos + T] = self._dequant(v_idx, v_nrm, rot).reshape(T, H, D).to(torch.bfloat16)
 
     def get(self, layer: int, dev=None) -> tuple[Tensor, Tensor]:
-        # O(1): slice pre-built buffer, no decompression
         tot = self._total_tokens + self._chunk_T  # includes current chunk
         k = self._k_buf[layer, :tot]
         v = self._v_buf[layer, :tot]
@@ -129,7 +134,8 @@ class TurboQuantKVCache:
             self._k_nrm[l].clear(); self._v_nrm[l].clear()
         self._total_tokens = 0
         self._chunk_T = 0
-        # GPU buffer reused in-place; positions 0..max_tokens will be overwritten on next use
+        self._cos_sin_key = None
+        self._cos_sin_val = None
 
     def memory_bytes(self) -> int:
         total = 0
@@ -142,7 +148,7 @@ class TurboQuantKVCache:
 
     def _quant(self, x: Tensor, rot: Tensor) -> tuple[Tensor, Tensor]:
         norms  = x.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        y      = (x / norms) @ rot.T                         # rotate unit-norm vector
+        y      = (x / norms) @ rot.T
         idx    = (y.unsqueeze(-1) - self.codebook).abs().argmin(dim=-1).to(torch.uint8)
         return idx, norms.squeeze(-1).float()
 
@@ -152,8 +158,8 @@ class TurboQuantKVCache:
 
 @contextmanager
 def turboquant_attention(model, cache: TurboQuantKVCache) -> Generator[None, None, None]:
-    # Patches every CausalSelfAttention to use the KV cache instead of Flash Attention.
-    # Call pattern: cache.begin_chunk(T) → with turboquant_attention(...): forward → cache.end_chunk()
+    # Patches every CausalSelfAttention to use the KV cache.
+    # Enter ONCE before the chunk loop — not once per chunk.
     orig: dict[int, object] = {}
 
     def _make_patched(layer_idx: int, attn):
@@ -177,10 +183,17 @@ def turboquant_attention(model, cache: TurboQuantKVCache) -> Generator[None, Non
             q = F.rms_norm(q, (Dh,))
             k = F.rms_norm(k, (Dh,))
 
-            # RoPE at absolute positions for correct cross-chunk positional encoding
-            cos, sin = _build_cos_sin(attn.rope_dims, attn.rotary.base,
-                                      attn.rotary.train_seq_len,
-                                      cache.pos_offset + T_new, x.device, q.dtype)
+            # Cos/sin: all layers in one chunk share the same T_total+dtype — compute once
+            T_total = cache.pos_offset + T_new
+            cos_sin_key = (T_total, q.dtype)
+            if cache._cos_sin_key != cos_sin_key:
+                cos, sin = _build_cos_sin(attn.rope_dims, attn.rotary.base,
+                                          attn.rotary.train_seq_len,
+                                          T_total, x.device, q.dtype)
+                cache._cos_sin_key = cos_sin_key
+                cache._cos_sin_val = (cos, sin)
+            cos, sin = cache._cos_sin_val
+
             cos_new = cos[:, cache.pos_offset:, :, :]
             sin_new = sin[:, cache.pos_offset:, :, :]
             q = _apply_rotary_emb(q, cos_new, sin_new, attn.rope_dims)
@@ -211,7 +224,7 @@ def turboquant_attention(model, cache: TurboQuantKVCache) -> Generator[None, Non
                 y = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask)
 
             if attn.use_xsa:
-                v_dq = v_full[-T_new:].unsqueeze(0).to(q_s)  # dequantized current-chunk v
+                v_dq = v_full[-T_new:].unsqueeze(0).to(q_s)
                 y = attn._xsa_efficient(y.permute(0, 2, 1, 3), v_dq).permute(0, 2, 1, 3)
             if attn.gated_attention:
                 y = y.permute(0, 2, 1, 3) * torch.sigmoid(attn.attn_gate(x)).unsqueeze(-1)
@@ -231,23 +244,34 @@ def turboquant_attention(model, cache: TurboQuantKVCache) -> Generator[None, Non
 
 
 def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut,
-                        is_boundary_token_lut, device, bits=3, chunk_size=64,
-                        warmup_tokens=128, seed=42, max_context_tokens=8192) -> tuple[float, float]:
+                        is_boundary_token_lut, device, bits=3, chunk_size=512,
+                        warmup_tokens=128, seed=42, max_context_tokens=8192,
+                        rank=0, world_size=1) -> tuple[float, float]:
     model.eval()
     attn0 = model.blocks[0].attn
     cache = TurboQuantKVCache(model.num_layers, attn0.num_kv_heads, attn0.head_dim,
                               bits=bits, device=device, seed=seed,
                               max_tokens=max_context_tokens)
 
+    # Shard val_tokens across ranks so all GPUs eval in parallel
     total_tokens = val_tokens.numel() - 1
+    if world_size > 1:
+        per_rank  = (total_tokens + world_size - 1) // world_size
+        tok_start = rank * per_rank
+        tok_end   = min(tok_start + per_rank, total_tokens)
+        val_tokens = val_tokens[tok_start : tok_end + 1]  # +1 for targets
+        total_tokens = tok_end - tok_start
+    else:
+        tok_start = 0
+
     loss_sum = token_count = byte_count = torch.zeros((), dtype=torch.float64, device=device)
     tokens_since_clear = 0
-
     total_chunks = (total_tokens + chunk_size - 1) // chunk_size
-    t0 = torch.cuda.Event(enable_timing=True)
-    t0.record()
+    t_last = time.perf_counter()
 
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+    # Patch attention once for the whole eval — not once per chunk
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16), \
+         turboquant_attention(model, cache):
         for chunk_idx, chunk_start in enumerate(range(0, total_tokens, chunk_size)):
             if tokens_since_clear >= max_context_tokens:
                 cache.clear()
@@ -258,17 +282,36 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
             x = val_tokens[chunk_start    : chunk_end    ].to(device).long().unsqueeze(0)
             y = val_tokens[chunk_start + 1: chunk_end + 1].to(device).long()
 
-            cache.begin_chunk(T_new)
-            with turboquant_attention(model, cache):
+            # First 3 chunks: print GPU-synced breakdown to show where time goes
+            if chunk_idx < 3 and rank == 0:
+                torch.cuda.synchronize()
+                t_pre = time.perf_counter()
+                cache.begin_chunk(T_new)
                 logits = model.forward_logits(x)
-            cache.end_chunk()
+                torch.cuda.synchronize()
+                t_post_fwd = time.perf_counter()
+                cache.end_chunk()
+                t_post = time.perf_counter()
+                print(f"  [TQ timing chunk {chunk_idx}] "
+                      f"fwd={1000*(t_post_fwd-t_pre):.1f}ms  "
+                      f"total={1000*(t_post-t_pre):.1f}ms  "
+                      f"T_new={T_new} T_cache={cache.seq_len}", flush=True)
+            else:
+                cache.begin_chunk(T_new)
+                logits = model.forward_logits(x)
+                cache.end_chunk()
             tokens_since_clear += T_new
 
-            if chunk_idx % 10000 == 0 and chunk_idx > 0:
-                print(f"  turboquant_kv: chunk {chunk_idx}/{total_chunks} "
-                      f"({100*chunk_idx/total_chunks:.1f}%)", flush=True)
+            if chunk_idx % 1000 == 0 and chunk_idx > 0:
+                t_now = time.perf_counter()
+                ms_per_chunk = (t_now - t_last) / 1000 * 1000
+                print(f"  turboquant_kv [rank {rank}]: chunk {chunk_idx}/{total_chunks} "
+                      f"({100*chunk_idx/total_chunks:.1f}%) — {ms_per_chunk:.2f} ms/chunk", flush=True)
+                t_last = t_now
 
-            s = max(0, warmup_tokens - chunk_start)
+            # Absolute position of first token in this chunk (accounts for rank sharding)
+            abs_chunk_start = tok_start + chunk_start
+            s = max(0, warmup_tokens - abs_chunk_start)
             if s >= T_new:
                 continue
 
@@ -281,7 +324,14 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
             tb  += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
             byte_count = byte_count + tb.sum()
 
+    # All-reduce across ranks when running distributed
+    if world_size > 1:
+        import torch.distributed as dist
+        for t in (loss_sum, token_count, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+
     val_loss = (loss_sum / token_count).item()
-    print(f"[TurboQuant] {cache.seq_len} tokens, {cache.memory_bytes()/1024/1024:.1f} MB cache")
+    if rank == 0:
+        print(f"[TurboQuant] {cache.seq_len} tokens/rank, {cache.memory_bytes()/1024/1024:.1f} MB cache")
     model.train()
     return val_loss, (val_loss / math.log(2.0)) * (token_count.item() / byte_count.item())
