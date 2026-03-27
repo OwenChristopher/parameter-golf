@@ -41,15 +41,21 @@ def _build_cos_sin(rope_dims, base, train_seq_len, T_total, device, dtype):
 
 class TurboQuantKVCache:
     # TurboQuant_mse (Zandieh et al. 2025): normalize → random rotate → Lloyd-Max quantize
-    # At 3 bits quality-neutral vs fp16; at 2.5 bits marginal loss (per paper §4.2)
+    # At 3.5 bits quality-neutral vs fp16; at 2.5 bits marginal loss (per paper §4.2)
+    #
+    # GPU-resident dequantized buffer: pre-allocate [num_layers, max_tokens, H, D] on GPU.
+    # append() writes new tokens in-place at pos _total_tokens — no allocation per chunk.
+    # get() is a free slice — no concatenation, no CPU→GPU transfer, no decompression.
 
-    def __init__(self, num_layers, num_kv_heads, head_dim, bits=3, device=None, seed=42):
+    def __init__(self, num_layers, num_kv_heads, head_dim, bits=3, device=None, seed=42,
+                 max_tokens=8192):
         assert bits in _CODEBOOKS
         self.num_layers   = num_layers
         self.num_kv_heads = num_kv_heads
         self.head_dim     = head_dim
         self.bits         = bits
         self.device       = device or torch.device("cuda")
+        self.max_tokens   = max_tokens
 
         # Scale codebook from N(0,1) to N(0,1/D) — what each coord looks like after rotation
         cb = torch.tensor(_CODEBOOKS[bits], dtype=torch.float32, device=self.device)
@@ -63,10 +69,18 @@ class TurboQuantKVCache:
             Q, _ = torch.linalg.qr(torch.randn(head_dim, head_dim, generator=rng))
             self._rot_cpu.append(Q.contiguous())
 
+        # CPU compressed storage for memory_bytes() accounting only
         self._k_idx: list[list[Tensor]] = [[] for _ in range(num_layers)]
         self._v_idx: list[list[Tensor]] = [[] for _ in range(num_layers)]
         self._k_nrm: list[list[Tensor]] = [[] for _ in range(num_layers)]
         self._v_nrm: list[list[Tensor]] = [[] for _ in range(num_layers)]
+
+        # Pre-allocated GPU dequantized buffers — written in-place, never reallocated
+        # Shape: [num_layers, max_tokens, num_kv_heads, head_dim]
+        buf_shape = (num_layers, max_tokens, num_kv_heads, head_dim)
+        self._k_buf: Tensor = torch.empty(buf_shape, dtype=torch.bfloat16, device=self.device)
+        self._v_buf: Tensor = torch.empty(buf_shape, dtype=torch.bfloat16, device=self.device)
+
         self._total_tokens: int = 0
         self._chunk_T:      int = 0
 
@@ -90,23 +104,24 @@ class TurboQuantKVCache:
         T, H, D = k.shape
         k_idx, k_nrm = self._quant(k.reshape(T * H, D), rot)
         v_idx, v_nrm = self._quant(v.reshape(T * H, D), rot)
-        # Keep on CPU to free GPU memory for attention
+        # CPU compressed storage for memory accounting
         self._k_idx[layer].append(k_idx.reshape(T, H, D).cpu())
         self._v_idx[layer].append(v_idx.reshape(T, H, D).cpu())
         self._k_nrm[layer].append(k_nrm.reshape(T, H).half().cpu())
         self._v_nrm[layer].append(v_nrm.reshape(T, H).half().cpu())
+        # In-place write into pre-allocated GPU buffer — no allocation, no copy overhead
+        pos = self._total_tokens
+        self._k_buf[layer, pos:pos + T] = self._dequant(k_idx, k_nrm, rot).reshape(T, H, D).to(torch.bfloat16)
+        self._v_buf[layer, pos:pos + T] = self._dequant(v_idx, v_nrm, rot).reshape(T, H, D).to(torch.bfloat16)
 
     def get(self, layer: int, dev=None) -> tuple[Tensor, Tensor]:
-        dev = dev or self.device
-        rot   = self._rot_cpu[layer].to(dev)
-        k_idx = torch.cat(self._k_idx[layer], 0).to(dev)
-        v_idx = torch.cat(self._v_idx[layer], 0).to(dev)
-        k_nrm = torch.cat(self._k_nrm[layer], 0).to(dev)
-        v_nrm = torch.cat(self._v_nrm[layer], 0).to(dev)
-        tot, H, D = k_idx.shape
-        k = self._dequant(k_idx.reshape(tot * H, D), k_nrm.reshape(tot * H), rot)
-        v = self._dequant(v_idx.reshape(tot * H, D), v_nrm.reshape(tot * H), rot)
-        return k.reshape(tot, H, D), v.reshape(tot, H, D)
+        # O(1): slice pre-built buffer, no decompression
+        tot = self._total_tokens + self._chunk_T  # includes current chunk
+        k = self._k_buf[layer, :tot]
+        v = self._v_buf[layer, :tot]
+        if dev is not None and dev != self._k_buf.device:
+            k, v = k.to(dev), v.to(dev)
+        return k, v
 
     def clear(self) -> None:
         for l in range(self.num_layers):
@@ -114,6 +129,7 @@ class TurboQuantKVCache:
             self._k_nrm[l].clear(); self._v_nrm[l].clear()
         self._total_tokens = 0
         self._chunk_T = 0
+        # GPU buffer reused in-place; positions 0..max_tokens will be overwritten on next use
 
     def memory_bytes(self) -> int:
         total = 0
@@ -220,7 +236,8 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
     model.eval()
     attn0 = model.blocks[0].attn
     cache = TurboQuantKVCache(model.num_layers, attn0.num_kv_heads, attn0.head_dim,
-                              bits=bits, device=device, seed=seed)
+                              bits=bits, device=device, seed=seed,
+                              max_tokens=max_context_tokens)
 
     total_tokens = val_tokens.numel() - 1
     loss_sum = token_count = byte_count = torch.zeros((), dtype=torch.float64, device=device)
