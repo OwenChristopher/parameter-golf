@@ -1901,6 +1901,7 @@ def main() -> None:
         tq_loss, tq_bpb = eval_val_turboquant(
             eval_model, val_tokens, base_bytes_lut, has_leading_space_lut,
             is_boundary_token_lut, device, bits=args.tq_bits,
+            rank=rank, world_size=world_size,
         )
         torch.cuda.synchronize()
         log0(f"turboquant_kv val_loss:{tq_loss:.4f} val_bpb:{tq_bpb:.4f} "
