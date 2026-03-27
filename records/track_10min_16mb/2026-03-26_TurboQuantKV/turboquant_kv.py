@@ -183,21 +183,20 @@ def turboquant_attention(model, cache: TurboQuantKVCache) -> Generator[None, Non
             k_s  = k_s.repeat_interleave(reps, dim=1)
             v_s  = v_s.repeat_interleave(reps, dim=1)
 
-            # New tokens see all cached tokens freely; causal only within the new chunk
+            # Bool mask: True=attend. All cached tokens visible; causal only within new chunk
             T_prev    = T_cache - T_new
-            attn_mask = torch.zeros(1, 1, T_new, T_cache, device=x.device, dtype=q_s.dtype)
+            attn_mask = torch.ones(1, 1, T_new, T_cache, device=x.device, dtype=torch.bool)
             if T_new > 1:
-                attn_mask[0, 0, :, T_prev:] = torch.triu(
-                    torch.full((T_new, T_new), float("-inf"), device=x.device, dtype=q_s.dtype),
-                    diagonal=1,
+                attn_mask[0, 0, :, T_prev:] = torch.tril(
+                    torch.ones(T_new, T_new, device=x.device, dtype=torch.bool)
                 )
 
-            # Flash attention doesn't support arbitrary attn_mask; force math/efficient backend
-            with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
                 y = F.scaled_dot_product_attention(q_s, k_s, v_s, attn_mask=attn_mask)
 
             if attn.use_xsa:
-                y = attn._xsa_efficient(y.permute(0, 2, 1, 3), v).permute(0, 2, 1, 3)
+                v_dq = v_full[-T_new:].unsqueeze(0).to(q_s)  # dequantized current-chunk v
+                y = attn._xsa_efficient(y.permute(0, 2, 1, 3), v_dq).permute(0, 2, 1, 3)
             if attn.gated_attention:
                 y = y.permute(0, 2, 1, 3) * torch.sigmoid(attn.attn_gate(x)).unsqueeze(-1)
                 y = y.permute(0, 2, 1, 3)
