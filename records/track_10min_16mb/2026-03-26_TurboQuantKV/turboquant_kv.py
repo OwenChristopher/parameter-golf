@@ -217,7 +217,7 @@ def turboquant_attention(model, cache: TurboQuantKVCache) -> Generator[None, Non
 
 def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut,
                         is_boundary_token_lut, device, bits=3, chunk_size=64,
-                        warmup_tokens=128, seed=42) -> tuple[float, float]:
+                        warmup_tokens=128, seed=42, max_context_tokens=8192) -> tuple[float, float]:
     model.eval()
     attn0 = model.blocks[0].attn
     cache = TurboQuantKVCache(model.num_layers, attn0.num_kv_heads, attn0.head_dim,
@@ -225,9 +225,14 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
 
     total_tokens = val_tokens.numel() - 1
     loss_sum = token_count = byte_count = torch.zeros((), dtype=torch.float64, device=device)
+    tokens_since_clear = 0
 
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for chunk_start in range(0, total_tokens, chunk_size):
+            if tokens_since_clear >= max_context_tokens:
+                cache.clear()
+                tokens_since_clear = 0
+
             chunk_end = min(chunk_start + chunk_size, total_tokens)
             T_new = chunk_end - chunk_start
             x = val_tokens[chunk_start    : chunk_end    ].to(device).long().unsqueeze(0)
@@ -237,6 +242,7 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
             with turboquant_attention(model, cache):
                 logits = model.forward_logits(x)
             cache.end_chunk()
+            tokens_since_clear += T_new
 
             s = max(0, warmup_tokens - chunk_start)
             if s >= T_new:
