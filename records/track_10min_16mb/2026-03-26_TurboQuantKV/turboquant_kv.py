@@ -227,8 +227,12 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
     loss_sum = token_count = byte_count = torch.zeros((), dtype=torch.float64, device=device)
     tokens_since_clear = 0
 
+    total_chunks = (total_tokens + chunk_size - 1) // chunk_size
+    t0 = torch.cuda.Event(enable_timing=True)
+    t0.record()
+
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        for chunk_start in range(0, total_tokens, chunk_size):
+        for chunk_idx, chunk_start in enumerate(range(0, total_tokens, chunk_size)):
             if tokens_since_clear >= max_context_tokens:
                 cache.clear()
                 tokens_since_clear = 0
@@ -243,6 +247,10 @@ def eval_val_turboquant(model, val_tokens, base_bytes_lut, has_leading_space_lut
                 logits = model.forward_logits(x)
             cache.end_chunk()
             tokens_since_clear += T_new
+
+            if chunk_idx % 10000 == 0 and chunk_idx > 0:
+                print(f"  turboquant_kv: chunk {chunk_idx}/{total_chunks} "
+                      f"({100*chunk_idx/total_chunks:.1f}%)", flush=True)
 
             s = max(0, warmup_tokens - chunk_start)
             if s >= T_new:
